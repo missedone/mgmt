@@ -26,10 +26,10 @@ import (
 
 	"github.com/purpleidea/mgmt/util/errwrap"
 
-	etcd "go.etcd.io/etcd/clientv3"
-	rpctypes "go.etcd.io/etcd/etcdserver/api/v3rpc/rpctypes"
-	pb "go.etcd.io/etcd/etcdserver/etcdserverpb"
-	etcdtypes "go.etcd.io/etcd/pkg/types"
+	etcd "go.etcd.io/etcd/client/v3"
+	rpctypes "go.etcd.io/etcd/api/v3rpc/rpctypes"
+	pb "go.etcd.io/etcd/api/etcdserverpb"
+	etcdtypes "go.etcd.io/etcd/client/pkg/types"
 )
 
 // addSelfState is used to populate the initial state when I am adding myself.

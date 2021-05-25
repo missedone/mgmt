@@ -26,7 +26,7 @@ import (
 
 	"github.com/purpleidea/mgmt/util/errwrap"
 
-	etcdtypes "go.etcd.io/etcd/pkg/types"
+	etcdtypes "go.etcd.io/etcd/client/pkg/types"
 )
 
 // copyURL copies a URL.
