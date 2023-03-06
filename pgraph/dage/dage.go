@@ -123,11 +123,11 @@ type Engine struct {
 
 	graph *pgraph.Graph
 	state map[Vertex]*state
-	waits map[Vertex]*sync.WaitGroup // wg for the vertex Run func
 
 	// mutex wraps any internal operation so that this library is
 	// thread-safe. It especially guards access to graph and state fields.
 	mutex *sync.Mutex
+	rwmutex *sync.RWMutex
 	wg    *sync.WaitGroup
 
 	// pause/resume state machine signals
@@ -149,6 +149,7 @@ func (obj *Engine) Setup() error {
 	}
 	obj.state = make(map[Vertex]*state)
 	obj.mutex = &sync.Mutex{}
+	obj.rwmutex = &sync.RWMutex{}
 	obj.wg = &sync.WaitGroup{}
 
 	obj.pauseChan = make(chan struct{})
@@ -190,7 +191,7 @@ func (obj *Engine) addVertex(v Vertex) error {
 	// once per Lock/Unlock cycle?
 	topologicalSort, err := obj.graph.TopologicalSort()
 	if err != nil {
-		return err // not a dag!
+		return err // not a dag
 	}
 	_ = topologicalSort
 
@@ -200,7 +201,6 @@ func (obj *Engine) addVertex(v Vertex) error {
 		Event: func(ctx context.Context) error {
 			select {
 			case obj.state[v].eventsChan <- struct{}{}:
-				obj.Logf("%s", v.String()+": sent event!")
 				return nil
 
 			case <-ctx.Done():
@@ -240,7 +240,7 @@ func (obj *Engine) AddEdge(v1, v2 Vertex, e Edge) error {
 
 	topologicalSort, err := obj.graph.TopologicalSort()
 	if err != nil {
-		return err // not a dag!
+		return err // not a dag
 	}
 	_ = topologicalSort
 
@@ -281,9 +281,12 @@ func (obj *Engine) DeleteEdge(e Edge) error {
 // Lock must be used before modifying the running graph. Make sure to Unlock
 // when done.
 func (obj *Engine) Lock() { // pause
+	obj.rwmutex.Lock() // XXX: or should it go right after pauseChan?
 	select {
 	case obj.pauseChan <- struct{}{}:
 	}
+	//obj.rwmutex.Lock() // XXX: or should it go right before pauseChan?
+
 	// waiting for the pause to move to paused...
 	select {
 	case <-obj.pausedChan:
@@ -300,17 +303,36 @@ func (obj *Engine) Unlock() { // resume
 	select {
 	case obj.resumeChan <- struct{}{}:
 	}
+	//obj.rwmutex.Unlock() // XXX: or should it go right after resumedChan?
+
 	// waiting for the resume to move to resumed...
 	select {
 	case <-obj.resumedChan:
 	}
+	obj.rwmutex.Unlock() // XXX: or should it go right before resumedChan?
 }
 
+// Run kicks off the main engine. This takes a mutex. When we're "paused" the
+// mutex is temporarily released until we "resume". Those operations transition
+// with the engine Lock and Unlock methods. It is recommended to only add
+// vertices to the engine after it's running. If you add them before Run, then
+// Run will cause a Lock/Unlock to occur to cycle them in.
 func (obj *Engine) Run(ctx context.Context) error {
 	obj.mutex.Lock()
 	defer obj.mutex.Unlock()
 	obj.wg.Add(1)
 	defer obj.wg.Done()
+	if n := obj.graph.NumVertices(); n > 0 { // hack to make the api easier
+		obj.Logf("graph contained %d vertices before Run", n)
+		obj.wg.Add(1)
+		go func() {
+			defer obj.wg.Done()
+			// kick the engine once to pull in any vertices from
+			// before we started running!
+			defer obj.Unlock()
+			obj.Lock()
+		}()
+	}
 	// we start off "running", but we'll have an empty graph initially...
 	for {
 
@@ -325,7 +347,8 @@ func (obj *Engine) Run(ctx context.Context) error {
 
 		// Toposort for paused workers. We run this before the actual
 		// pause completes, because the second we are paused, the graph
-		// could then immediately change.
+		// could then immediately change. We don't need a lock in here
+		// because the mutex only unlocks when pause is complete below.
 		topoSort1, err := obj.graph.TopologicalSort()
 		if err != nil {
 			return err
@@ -401,13 +424,17 @@ func (obj *Engine) Run(ctx context.Context) error {
 						}
 					}
 
-					//XXX: we need to maybe add a mutex here because we don't want to be adding a new vertex here but then missing to send an event to it because it started after we did the range...
-					//XXX: or maybe the mutex goes above the select and also blocks events???
-					//XXX: maybe an RWLock?
-					//XXX:					obj.mutex.Rlock()
+					// XXX: maybe the rwmutex goes above the select and also blocks events???
 
+					// XXX: I think we need this read lock
+					// because we don't want to be adding a
+					// new vertex here but then missing to
+					// send an event to it because it
+					// started after we did the range...
+					obj.rwmutex.RLock()
 					// XXX: cache/memoize this value
 					outgoing := obj.graph.OutgoingGraphVertices(v) // []Vertex
+					obj.rwmutex.RUnlock()
 					for _, xv := range outgoing {
 						xv, ok := xv.(Vertex)
 						if !ok {

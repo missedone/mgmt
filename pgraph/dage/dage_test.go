@@ -40,6 +40,8 @@ type myVertex struct {
 	eventsChan chan struct{}
 	closedChan chan struct{}
 	closed     bool
+
+	testPokeChan chan struct{}
 }
 
 func (obj *myVertex) String() string {
@@ -54,11 +56,14 @@ func (obj *myVertex) Init(init *Init) error {
 	obj.eventsChan = make(chan struct{})
 	obj.closedChan = make(chan struct{})
 
+	obj.testPokeChan = make(chan struct{})
+
 	return nil
 }
 
 func (obj *myVertex) Close() error {
 	//close(obj.eventsChan) // leave it so we don't send on a closed channel
+	close(obj.testPokeChan)
 	return nil
 }
 
@@ -71,7 +76,10 @@ func (obj *myVertex) Run(ctx context.Context) error {
 	close(startupChan)
 	event := func() {
 		startupChan = nil // we get at most one startup event somewhere
-		_ = obj.init.Event(ctx)
+		if err := obj.init.Event(ctx); err != nil {
+			return
+		}
+		obj.init.Logf("sent event")
 	}
 
 	for {
@@ -80,7 +88,10 @@ func (obj *myVertex) Run(ctx context.Context) error {
 			// cause the initial startup event to get sent!
 
 		case <-obj.eventsChan:
-			obj.init.Logf("%s", obj.String()+": recv event!")
+			obj.init.Logf("recv event")
+
+		case <-obj.testPokeChan:
+			obj.init.Logf("test poke event")
 
 		case <-ctx.Done(): // when asked to exit
 			obj.closed = true
@@ -108,6 +119,15 @@ func (obj *myVertex) Event() error {
 	}
 }
 
+// TestPoke is a test mechanism to cause an extra event to occur.
+func (obj *myVertex) TestPoke() {
+	select {
+	case obj.testPokeChan <- struct{}{}:
+	case <-obj.closedChan:
+	}
+}
+
+
 type myEdge struct {
 	Name string
 }
@@ -125,7 +145,7 @@ func panicErr(err error) {
 func TestDage1(t *testing.T) {
 	//now := time.Now()
 	min := 5 * time.Second // approx min time needed for the test
-	ctx := context.Background()
+	ctx, cancel := context.WithCancel(context.Background())
 	if deadline, ok := t.Deadline(); ok {
 		d := deadline.Add(-min)
 		//t.Logf("  now: %+v", now)
@@ -195,6 +215,10 @@ func TestDage1(t *testing.T) {
 	e2 := &myEdge{Name: "e2"}
 	e3 := &myEdge{Name: "e3"}
 
+	t.Logf("test waiting...")
+	time.Sleep(3 * time.Second)
+
+	// XXX: lock/unlock could race with the cancel and deadlock here!
 	engine.Lock()
 	//engine.Op(fn) // Could do multiple graph op's in one mutex?
 
@@ -204,6 +228,38 @@ func TestDage1(t *testing.T) {
 	panicErr(engine.AddEdge(v2, v3, e2)) // connect the first and second chunks
 
 	engine.Unlock()
-
+	t.Logf("test waiting again...")
 	time.Sleep(3 * time.Second)
+
+	engine.Lock()
+	v0 := &myVertex{Name: "v0"}
+	e0 := &myEdge{Name: "e0"}
+	panicErr(engine.AddVertex(v0))
+	panicErr(engine.AddEdge(v0, v1, e0)) // connect a new vertex at the top
+	engine.Unlock()
+	t.Logf("test waiting third...")
+
+
+
+	time.Sleep(1 * time.Second)
+	t.Logf("poke v1...")
+	v1.TestPoke()
+
+	time.Sleep(1 * time.Second)
+	t.Logf("poke v2...")
+	v2.TestPoke()
+
+	time.Sleep(1 * time.Second)
+	t.Logf("poke v3...")
+	v3.TestPoke()
+
+	time.Sleep(1 * time.Second)
+	t.Logf("poke v4...")
+	v4.TestPoke()
+
+
+
+	time.Sleep(3 * time.Second) // TODO: wait for some success metric/signal
+	t.Logf("test done...")
+	cancel()
 }
