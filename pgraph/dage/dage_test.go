@@ -39,7 +39,6 @@ type myVertex struct {
 
 	eventsChan chan struct{}
 	closedChan chan struct{}
-	closed     bool
 
 	testPokeChan chan struct{}
 }
@@ -94,7 +93,6 @@ func (obj *myVertex) Run(ctx context.Context) error {
 			obj.init.Logf("test poke event")
 
 		case <-ctx.Done(): // when asked to exit
-			obj.closed = true
 			return nil // we exit happily
 		}
 
@@ -109,9 +107,6 @@ func (obj *myVertex) Run(ctx context.Context) error {
 func (obj *myVertex) Event() error {
 	select {
 	case obj.eventsChan <- struct{}{}: // is this too simple a mechanism?
-		if obj.closed {
-			return ErrClosed
-		}
 		return nil
 
 	case <-obj.closedChan:
@@ -126,7 +121,6 @@ func (obj *myVertex) TestPoke() {
 	case <-obj.closedChan:
 	}
 }
-
 
 type myEdge struct {
 	Name string
@@ -239,8 +233,6 @@ func TestDage1(t *testing.T) {
 	engine.Unlock()
 	t.Logf("test waiting third...")
 
-
-
 	time.Sleep(1 * time.Second)
 	t.Logf("poke v1...")
 	v1.TestPoke()
@@ -256,8 +248,6 @@ func TestDage1(t *testing.T) {
 	time.Sleep(1 * time.Second)
 	t.Logf("poke v4...")
 	v4.TestPoke()
-
-
 
 	time.Sleep(3 * time.Second) // TODO: wait for some success metric/signal
 	t.Logf("test done...")

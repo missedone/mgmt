@@ -126,9 +126,9 @@ type Engine struct {
 
 	// mutex wraps any internal operation so that this library is
 	// thread-safe. It especially guards access to graph and state fields.
-	mutex *sync.Mutex
+	mutex   *sync.Mutex
 	rwmutex *sync.RWMutex
-	wg    *sync.WaitGroup
+	wg      *sync.WaitGroup
 
 	// pause/resume state machine signals
 	pauseChan   chan struct{}
@@ -179,11 +179,16 @@ func (obj *Engine) addVertex(v Vertex) error {
 		return nil
 	}
 
-	obj.state[v] = &state{
+	// This is the one of two places where we modify this map. To avoid
+	// concurrent writes, we only do this when we're locked! Anywhere that
+	// can read where we are locked must have a mutex around it or do the
+	// lookup when we're in an unlocked state.
+	n := &state{
 		running:    false,
 		eventsChan: make(chan struct{}),
 		wg:         &sync.WaitGroup{},
 	}
+	obj.state[v] = n // n for node
 
 	obj.graph.AddVertex(v)
 
@@ -200,7 +205,7 @@ func (obj *Engine) addVertex(v Vertex) error {
 		// event to the children/descendent vertices!
 		Event: func(ctx context.Context) error {
 			select {
-			case obj.state[v].eventsChan <- struct{}{}:
+			case n.eventsChan <- struct{}{}:
 				return nil
 
 			case <-ctx.Done():
@@ -251,16 +256,21 @@ func (obj *Engine) DeleteVertex(v Vertex) error {
 	obj.mutex.Lock()
 	defer obj.mutex.Unlock()
 
-	if _, exists := obj.state[v]; !exists {
+	n, exists := obj.state[v]
+	if !exists {
 		return fmt.Errorf("vertex %s doesn't exist", v)
 	}
 
-	if obj.state[v].running {
+	if n.running {
 		// cancel the running vertex
-		obj.state[v].cancelCtx()
-		obj.state[v].wg.Wait()
+		n.cancelCtx()
+		n.wg.Wait()
 	}
 
+	// This is the one of two places where we modify this map. To avoid
+	// concurrent writes, we only do this when we're locked! Anywhere that
+	// can read where we are locked must have a mutex around it or do the
+	// lookup when we're in an unlocked state.
 	delete(obj.state, v)
 	obj.graph.DeleteVertex(v)
 	return v.Close()
@@ -316,7 +326,9 @@ func (obj *Engine) Unlock() { // resume
 // mutex is temporarily released until we "resume". Those operations transition
 // with the engine Lock and Unlock methods. It is recommended to only add
 // vertices to the engine after it's running. If you add them before Run, then
-// Run will cause a Lock/Unlock to occur to cycle them in.
+// Run will cause a Lock/Unlock to occur to cycle them in. Lock and Unlock race
+// with the cancellation of this Run main loop. Make sure to only call one at a
+// time.
 func (obj *Engine) Run(ctx context.Context) error {
 	obj.mutex.Lock()
 	defer obj.mutex.Unlock()
@@ -391,34 +403,38 @@ func (obj *Engine) Run(ctx context.Context) error {
 			if !ok {
 				panic("not a vertex")
 			}
+			n := obj.state[v] // n for node
 
-			if obj.state[v].running { // it's not a new vertex
+			if n.running { // it's not a new vertex
 				continue
 			}
-			obj.state[v].running = true
+			n.running = true
 
 			// run mainloop
-			obj.state[v].wg.Add(1)
-			go func(v Vertex) {
-				defer obj.state[v].wg.Done()
-				defer close(obj.state[v].eventsChan)
+			n.wg.Add(1)
+			go func(v Vertex, n *state) {
+				defer n.wg.Done()
+				defer close(n.eventsChan)
 				ctx, cancel := context.WithCancel(ctx) // wrap parent
-				obj.state[v].ctx = ctx
-				obj.state[v].cancelCtx = cancel
-				runErr := v.Run(obj.state[v].ctx)
+				n.ctx = ctx
+				n.cancelCtx = cancel
+				runErr := v.Run(n.ctx)
 				if runErr != nil {
 					// XXX: send to a channel
 				}
 
-			}(v)
+			}(v, n)
 
 			// process events
-			obj.state[v].wg.Add(1)
-			go func(v Vertex) {
-				defer obj.state[v].wg.Done()
+			n.wg.Add(1)
+			go func(v Vertex, n *state) {
+				defer n.wg.Done()
 				for {
+					// <-eventsChan is a map race if we did
+					// the lookup here. So instead, we do a
+					// n := obj.state[v] and use that here.
 					select {
-					case _, ok := <-obj.state[v].eventsChan:
+					case _, ok := <-n.eventsChan:
 						if !ok { // no more events
 							return
 						}
@@ -453,7 +469,7 @@ func (obj *Engine) Run(ctx context.Context) error {
 						}
 					}
 				}
-			}(v)
+			}(v, n)
 		}
 		// now check their states...
 		for _, v := range reversed {
