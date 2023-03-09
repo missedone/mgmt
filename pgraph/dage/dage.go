@@ -146,10 +146,9 @@ type Engine struct {
 	resumeChan  chan struct{}
 	resumedChan chan struct{}
 
-	ag      chan error // used to aggregate events
-	agwg *sync.WaitGroup
+	ag         chan error // used to aggregate events
+	agwg       *sync.WaitGroup
 	streamChan chan error
-
 }
 
 // Setup sets up the internal datastructures needed for this engine.
@@ -187,6 +186,12 @@ func (obj *Engine) Cleanup() error {
 	close(obj.resumeChan)
 	close(obj.resumedChan)
 	return nil
+}
+
+// Graph returns a handle to the current graph. It should not be read or
+// modified without the XXX mutex.
+func (obj *Engine) Graph() *pgraph.Graph {
+	return obj.graph
 }
 
 // addVertex is the lockless version of the AddVertex function. This is needed
@@ -592,7 +597,6 @@ func (obj *Engine) Run(ctx context.Context) error {
 
 	} // end for
 }
-
 
 // XXX chan-> or ->chan ?
 func (obj *Engine) Stream() chan error {
