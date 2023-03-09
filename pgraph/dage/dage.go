@@ -118,6 +118,16 @@ type Engine struct {
 	// that is held within it.
 	Name string
 
+	// Glitch: https://en.wikipedia.org/wiki/Reactive_programming#Glitches
+	Glitch bool // allow glitching? (more responsive, but less accurate)
+
+	// Callback can be specified as an alternative to using the Stream
+	// method to get events. If the context on it is cancelled, then it must
+	// shutdown quickly, because this means we are closing and want to
+	// disconnect. Whether you want to respect that is up to you, but the
+	// engine will not be able to close until you do.
+	Callback func(context.Context)
+
 	Debug bool
 	Logf  func(format string, v ...interface{})
 
@@ -135,6 +145,11 @@ type Engine struct {
 	pausedChan  chan struct{}
 	resumeChan  chan struct{}
 	resumedChan chan struct{}
+
+	ag      chan error // used to aggregate events
+	agwg *sync.WaitGroup
+	streamChan chan error
+
 }
 
 // Setup sets up the internal datastructures needed for this engine.
@@ -156,6 +171,10 @@ func (obj *Engine) Setup() error {
 	obj.pausedChan = make(chan struct{})
 	obj.resumeChan = make(chan struct{})
 	obj.resumedChan = make(chan struct{})
+
+	obj.ag = make(chan error)
+	obj.agwg = &sync.WaitGroup{}
+	obj.streamChan = make(chan error)
 
 	return nil
 }
@@ -334,6 +353,9 @@ func (obj *Engine) Run(ctx context.Context) error {
 	defer obj.mutex.Unlock()
 	obj.wg.Add(1)
 	defer obj.wg.Done()
+	ctx, cancel := context.WithCancel(ctx) // wrap parent
+	defer cancel()
+
 	if n := obj.graph.NumVertices(); n > 0 { // hack to make the api easier
 		obj.Logf("graph contained %d vertices before Run", n)
 		obj.wg.Add(1)
@@ -345,6 +367,55 @@ func (obj *Engine) Run(ctx context.Context) error {
 			obj.Lock()
 		}()
 	}
+
+	// close the aggregate channel when everyone is done with it...
+	obj.wg.Add(1)
+	go func() {
+		defer obj.wg.Done()
+		select {
+		case <-ctx.Done():
+		}
+		// don't wait and close ag before we're really done with Run()
+		obj.agwg.Wait() // wait for last ag user to close
+		close(obj.ag)   // last one closes the ag channel
+	}()
+
+	// aggregate events channel
+	obj.wg.Add(1)
+	go func() {
+		defer obj.wg.Done()
+		defer close(obj.streamChan)
+		for {
+			var err error
+			var ok bool
+			select {
+			case err, ok = <-obj.ag: // aggregated channel
+				if !ok {
+					return // channel shutdown
+				}
+			}
+
+			// now send event...
+			if obj.Callback != nil {
+				// send stream signal (callback variant)
+				obj.Callback(ctx)
+			} else {
+				// send stream signal
+				select {
+				// send events or errors on streamChan
+				case obj.streamChan <- err: // send
+					if err != nil {
+						cancel() // cancel the context!
+						return
+					}
+				case <-ctx.Done(): // when asked to exit
+					return
+				}
+			}
+
+		}
+	}()
+
 	// we start off "running", but we'll have an empty graph initially...
 	for {
 
@@ -412,23 +483,34 @@ func (obj *Engine) Run(ctx context.Context) error {
 
 			// run mainloop
 			n.wg.Add(1)
+			obj.agwg.Add(1)
 			go func(v Vertex, n *state) {
 				defer n.wg.Done()
 				defer close(n.eventsChan)
+				defer obj.agwg.Done()
 				ctx, cancel := context.WithCancel(ctx) // wrap parent
 				n.ctx = ctx
 				n.cancelCtx = cancel
 				runErr := v.Run(n.ctx)
 				if runErr != nil {
-					// XXX: send to a channel
+					// send to a aggregate channel
+					// the first to error will cause ag to
+					// shutdown, so make sure we can exit...
+					select {
+					case obj.ag <- runErr: // send to aggregate channel
+					case <-ctx.Done():
+					}
 				}
+				// XXX: if node never loaded, then we error!
 
 			}(v, n)
 
 			// process events
 			n.wg.Add(1)
+			obj.agwg.Add(1)
 			go func(v Vertex, n *state) {
 				defer n.wg.Done()
+				defer obj.agwg.Done()
 				for {
 					// <-eventsChan is a map race if we did
 					// the lookup here. So instead, we do a
@@ -468,6 +550,16 @@ func (obj *Engine) Run(ctx context.Context) error {
 							// TODO: should we do anything?
 						}
 					}
+
+					if obj.Glitch || len(outgoing) == 0 {
+						select {
+						case obj.ag <- nil: // send to aggregate channel
+						case <-ctx.Done():
+							// let eventsChan return
+							//return
+						}
+					}
+
 				}
 			}(v, n)
 		}
@@ -499,6 +591,12 @@ func (obj *Engine) Run(ctx context.Context) error {
 		}
 
 	} // end for
+}
+
+
+// XXX chan-> or ->chan ?
+func (obj *Engine) Stream() chan error {
+	return obj.streamChan
 }
 
 // state tracks some internal vertex-specific state information.

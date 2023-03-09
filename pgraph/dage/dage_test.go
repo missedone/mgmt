@@ -138,6 +138,10 @@ func panicErr(err error) {
 
 func TestDage1(t *testing.T) {
 	//now := time.Now()
+
+	wg := &sync.WaitGroup{}
+	defer wg.Wait()
+
 	min := 5 * time.Second // approx min time needed for the test
 	ctx, cancel := context.WithCancel(context.Background())
 	if deadline, ok := t.Deadline(); ok {
@@ -148,9 +152,6 @@ func TestDage1(t *testing.T) {
 		ctx = newCtx
 		defer cancel()
 	}
-
-	wg := &sync.WaitGroup{}
-	defer wg.Wait()
 
 	wg.Add(1)
 	go func() {
@@ -202,6 +203,25 @@ func TestDage1(t *testing.T) {
 			return
 		}
 		t.Logf("engine shutdown cleanly...")
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		ch := engine.Stream()
+		for {
+			select {
+			case err, ok := <-ch: // channel must close to shutdown
+				if !ok {
+					return
+				}
+				if err != nil {
+					t.Errorf("graph error event: %v", err)
+					continue
+				}
+				t.Logf("graph stream event!")
+			}
+		}
 	}()
 
 	v3 := &myVertex{Name: "v3"}
